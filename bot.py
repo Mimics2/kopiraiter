@@ -1,10 +1,11 @@
+
 import os
 import sys
 import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict, Optional
 from collections import defaultdict
 
 import aiohttp
@@ -12,6 +13,7 @@ from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения
@@ -44,7 +46,7 @@ else:
     ]
 
 # Проверка API ключей
-if not GEMINI_API_KEYS or all(key == "your_gemini_api_key_" in key for key in GEMINI_API_KEYS):
+if not GEMINI_API_KEYS or all("your_gemini_api_key_" in key for key in GEMINI_API_KEYS):
     logger.warning("GEMINI_API_KEYS не установлены или используются значения по умолчанию!")
     logger.info("Пожалуйста, установите GEMINI_API_KEYS в переменных окружения Railway")
 
@@ -328,7 +330,12 @@ async def main():
         logger.info(f"Токен бота: {'установлен' if BOT_TOKEN else 'НЕ УСТАНОВЛЕН!'}")
         logger.info(f"Доступно API ключей Gemini: {len(GEMINI_API_KEYS)}")
         
-        bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+        # Новый синтаксис для aiogram 3.7.0+
+        bot = Bot(
+            token=BOT_TOKEN,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        )
+        
         dp = Dispatcher()
         dp.include_router(router)
         
@@ -344,4 +351,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
