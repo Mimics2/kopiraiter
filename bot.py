@@ -1,4 +1,3 @@
-
 import os
 import sys
 import json
@@ -41,8 +40,6 @@ else:
     # НО ЛУЧШЕ УКАЗЫВАТЬ В Railway Variables!
     GEMINI_API_KEYS = [
         "your_gemini_api_key_1_here",
-        "your_gemini_api_key_2_here", 
-        "your_gemini_api_key_3_here"
     ]
 
 # Проверка API ключей
@@ -50,7 +47,9 @@ if not GEMINI_API_KEYS or all("your_gemini_api_key_" in key for key in GEMINI_AP
     logger.warning("GEMINI_API_KEYS не установлены или используются значения по умолчанию!")
     logger.info("Пожалуйста, установите GEMINI_API_KEYS в переменных окружения Railway")
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+# Используем актуальную модель Gemini
+GEMINI_MODEL = "gemini-2.5-flash"  # Или "gemini-1.5-pro-latest"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # Структуры данных для хранения состояния
 user_requests: Dict[int, Dict] = defaultdict(dict)  # user_id -> {request_id: data}
@@ -73,6 +72,13 @@ def generate_request_id(user_id: int) -> str:
     """Генерация уникального ID запроса"""
     timestamp = int(datetime.now().timestamp())
     return f"{user_id}_{timestamp}"
+
+def escape_markdown(text: str) -> str:
+    """Экранирование спецсимволов Markdown"""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
 
 async def call_gemini_api(prompt: str, request_id: str) -> Optional[str]:
     """Вызов Gemini API"""
@@ -97,7 +103,7 @@ async def call_gemini_api(prompt: str, request_id: str) -> Optional[str]:
         
         url = f"{GEMINI_API_URL}?key={api_key}"
         
-        logger.info(f"Отправка запроса {request_id} в Gemini API")
+        logger.info(f"Отправка запроса {request_id} в Gemini API ({GEMINI_MODEL})")
         
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.post(url, json=payload, headers=headers) as response:
@@ -113,6 +119,21 @@ async def call_gemini_api(prompt: str, request_id: str) -> Optional[str]:
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка API для запроса {request_id}: {response.status} - {error_text}")
+                    
+                    # Попробуем старую модель если новая не работает
+                    if "is not found for API version" in error_text:
+                        logger.info("Пробуем использовать gemini-1.0-pro вместо gemini-1.5-flash-latest")
+                        old_model_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+                        old_url = f"{old_model_url}?key={api_key}"
+                        
+                        async with session.post(old_url, json=payload, headers=headers) as old_response:
+                            if old_response.status == 200:
+                                old_data = await old_response.json()
+                                if "candidates" in old_data and old_data["candidates"]:
+                                    text = old_data["candidates"][0]["content"]["parts"][0]["text"]
+                                    logger.info(f"Успешный ответ с gemini-pro для запроса {request_id}")
+                                    return text
+                    
                     return f"❌ Ошибка API: {response.status}"
                     
     except aiohttp.ClientError as e:
@@ -143,18 +164,26 @@ async def process_request_with_delay(user_id: int, request_id: str, bot: Bot):
                 # Вызываем API
                 response_text = await call_gemini_api(prompt, request_id)
                 
-                # Форматируем ответ со специальным символом
-                formatted_response = f"✨【Ответ на запрос {request_id}】✨\n\n{response_text}\n\n📌 Конец ответа"
+                # Форматируем ответ со специальным символом (экранируем для Markdown)
+                formatted_response = f"✨ Ответ на запрос {request_id} ✨\n\n{response_text}\n\n📌 Конец ответа"
+                
+                # Экранируем спецсимволы для Markdown
+                safe_response = escape_markdown(formatted_response)
                 
                 # Отправляем ответ
                 try:
                     await bot.send_message(
                         user_id, 
-                        formatted_response,
-                        parse_mode=ParseMode.MARKDOWN
+                        safe_response,
+                        parse_mode=ParseMode.MARKDOWN_V2
                     )
                 except Exception as e:
-                    logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+                    logger.error(f"Ошибка отправки с Markdown, пробуем без разметки: {e}")
+                    try:
+                        # Пробуем отправить без разметки
+                        await bot.send_message(user_id, formatted_response)
+                    except Exception as e2:
+                        logger.error(f"Ошибка отправки без разметки: {e2}")
             
             # Удаляем обработанный запрос
             if user_id in user_requests:
@@ -227,12 +256,12 @@ async def cmd_status(message: Message):
         for req_id, req_data in pending_requests.items():
             prompt_preview = req_data.get("prompt", "")[:50] + "..."
             created_time = req_data.get("created", "")
-            status_text += f"• ID: `{req_id}`\n"
+            status_text += f"• ID: {req_id}\n"
             status_text += f"  Текст: {prompt_preview}\n"
             status_text += f"  Создан: {created_time}\n"
             status_text += f"  Статус: ⏳ Ожидает обработки\n\n"
         
-        await message.answer(status_text, parse_mode=ParseMode.MARKDOWN)
+        await message.answer(status_text)
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message):
@@ -284,14 +313,14 @@ async def handle_message(message: Message):
     confirmation_text = f"""
 ✅ Запрос получен!
 
-📝 ID запроса: `{request_id}`
+📝 ID запроса: {request_id}
 🕐 Обработка начнется через 1 минуту...
 ✏️ Вы можете отправить дополнительные уточнения в течение этого времени.
 
 Используйте /status для проверки состояния.
 Используйте /cancel для отмены всех запросов.
 """
-    await message.answer(confirmation_text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(confirmation_text)
     
     # Если уже есть таймер для этого пользователя, отменяем его
     existing_timer_id = None
@@ -329,6 +358,7 @@ async def main():
         logger.info("Запуск бота...")
         logger.info(f"Токен бота: {'установлен' if BOT_TOKEN else 'НЕ УСТАНОВЛЕН!'}")
         logger.info(f"Доступно API ключей Gemini: {len(GEMINI_API_KEYS)}")
+        logger.info(f"Используемая модель Gemini: {GEMINI_MODEL}")
         
         # Новый синтаксис для aiogram 3.7.0+
         bot = Bot(
