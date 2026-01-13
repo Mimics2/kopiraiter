@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import asyncio
 import logging
 from datetime import datetime
@@ -11,7 +10,6 @@ import aiohttp
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
@@ -19,365 +17,236 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Конфигурация - ОБЯЗАТЕЛЬНО УКАЖИТЕ В Railway Variables!
+# === КОНФИГУРАЦИЯ ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN не установлен!")
-    logger.info("Пожалуйста, установите TELEGRAM_BOT_TOKEN в переменных окружения Railway")
+    logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
     sys.exit(1)
 
-GEMINI_API_KEYS_STR = os.getenv("GEMINI_API_KEYS", "")
-if GEMINI_API_KEYS_STR:
-    GEMINI_API_KEYS = [key.strip() for key in GEMINI_API_KEYS_STR.split(",") if key.strip()]
-else:
-    # Если ключи не указаны в переменных окружения, используйте этот список
-    # НО ЛУЧШЕ УКАЗЫВАТЬ В Railway Variables!
-    GEMINI_API_KEYS = [
-        "your_gemini_api_key_1_here",
-    ]
+GEMINI_API_KEYS = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
+if not GEMINI_API_KEYS:
+    logger.error("❌ GEMINI_API_KEYS не установлены!")
+    sys.exit(1)
 
-# Проверка API ключей
-if not GEMINI_API_KEYS or all("your_gemini_api_key_" in key for key in GEMINI_API_KEYS):
-    logger.warning("GEMINI_API_KEYS не установлены или используются значения по умолчанию!")
-    logger.info("Пожалуйста, установите GEMINI_API_KEYS в переменных окружения Railway")
+# === ПРОМТ ДЛЯ GEMINI ===
+# Меняйте этот промт в Railway Variables чтобы настроить Gemini
+SYSTEM_PROMPT = os.getenv("GEMINI_PROMPT", """Ты профессиональный копирайтер. Пиши ТОЛЬКО готовый контент без объяснений, без вступлений, без заключений.
 
-# Используем актуальную модель Gemini
-GEMINI_MODEL = "gemini-2.5-flash"  # Или "gemini-1.5-pro-latest"
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+ТВОИ ПРАВИЛА:
+1. Отвечай ТОЛЬКО готовым текстом/постом/контентом
+2. НИКАКИХ "Вот что я создал", "Вот мой ответ", "Этот текст" и т.д.
+3. НИКАКИХ объяснений процесса, мыслей, комментариев
+4. Просто дай готовый результат
+5. Если нужен формат (пост, статья, реклама) - сразу в этом формате
+6. Максимально подробно и полно, не обрезай текст
+7. Всё что нужно - пиши в одном ответе
 
-# Структуры данных для хранения состояния
-user_requests: Dict[int, Dict] = defaultdict(dict)  # user_id -> {request_id: data}
-request_timers: Dict[str, asyncio.Task] = {}
+Пример:
+Запрос: "Напиши пост для Instagram про кофе"
+Ответ: "Утренний ритуал начинается с аромата свежесваренного кофе... [полный текст поста]"
+
+Теперь следуй этим правилам для всех запросов.""")
+
+# Модель Gemini
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# === СИСТЕМА ===
+user_requests = defaultdict(dict)
+request_timers = {}
 current_key_index = 0
 router = Router()
 
-def get_next_api_key() -> str:
-    """Получить следующий API ключ (ротация)"""
+def get_next_api_key():
     global current_key_index
-    if not GEMINI_API_KEYS:
-        raise ValueError("No Gemini API keys available")
-    
     key = GEMINI_API_KEYS[current_key_index]
     current_key_index = (current_key_index + 1) % len(GEMINI_API_KEYS)
-    logger.info(f"Используется API ключ #{current_key_index}")
     return key
 
-def generate_request_id(user_id: int) -> str:
-    """Генерация уникального ID запроса"""
-    timestamp = int(datetime.now().timestamp())
-    return f"{user_id}_{timestamp}"
+def generate_request_id(user_id):
+    return f"{user_id}_{int(datetime.now().timestamp())}"
 
-def escape_markdown(text: str) -> str:
-    """Экранирование спецсимволов Markdown"""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    for char in escape_chars:
-        text = text.replace(char, f'\\{char}')
-    return text
-
-async def call_gemini_api(prompt: str, request_id: str) -> Optional[str]:
-    """Вызов Gemini API"""
+async def call_gemini_api(user_prompt: str, request_id: str) -> Optional[str]:
+    """Вызов Gemini API с системным промтом"""
     try:
         api_key = get_next_api_key()
         
-        headers = {
-            "Content-Type": "application/json",
-        }
+        # Комбинируем системный промт и промт пользователя
+        full_prompt = f"{SYSTEM_PROMPT}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_prompt}\n\nОТВЕТ (ТОЛЬКО КОНТЕНТ):"
         
         payload = {
             "contents": [{
-                "parts": [{"text": prompt}]
+                "parts": [{"text": full_prompt}]
             }],
             "generationConfig": {
-                "temperature": 0.7,
-                "topK": 40,
+                "temperature": 0.8,
                 "topP": 0.95,
-                "maxOutputTokens": 1024,
+                "topK": 40,
+                "maxOutputTokens": 2048,  # Увеличил для полных ответов
             }
         }
         
-        url = f"{GEMINI_API_URL}?key={api_key}"
+        url = f"{GEMINI_URL}?key={api_key}"
         
-        logger.info(f"Отправка запроса {request_id} в Gemini API ({GEMINI_MODEL})")
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, json=payload, headers=headers) as response:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(45)) as session:
+            async with session.post(url, json=payload) as response:
                 if response.status == 200:
                     data = await response.json()
+                    
+                    # Получаем ВЕСЬ текст ответа
                     if "candidates" in data and data["candidates"]:
                         text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        logger.info(f"Успешный ответ для запроса {request_id}")
-                        return text
+                        
+                        # Очищаем ответ от возможных префиксов
+                        clean_text = text.strip()
+                        
+                        # Удаляем возможные фразы типа "Вот что я создал" и т.д.
+                        unwanted_prefixes = [
+                            "Вот что я создал",
+                            "Вот мой ответ",
+                            "Этот текст",
+                            "Вот пост",
+                            "Вот статья",
+                            "Результат:",
+                            "Ответ:",
+                            "Текст:",
+                            "Пост:",
+                            "Статья:",
+                            "✨",
+                            "📝"
+                        ]
+                        
+                        for prefix in unwanted_prefixes:
+                            if clean_text.startswith(prefix):
+                                clean_text = clean_text[len(prefix):].strip()
+                        
+                        # Удаляем двоеточия в начале
+                        if clean_text.startswith(":"):
+                            clean_text = clean_text[1:].strip()
+                        
+                        logger.info(f"✅ Ответ Gemini получен ({len(clean_text)} символов)")
+                        return clean_text
                     else:
-                        logger.error(f"Неверный формат ответа для запроса {request_id}")
-                        return "❌ Ошибка: неверный формат ответа от API"
+                        logger.error("❌ Gemini вернул пустой ответ")
+                        return None
                 else:
                     error_text = await response.text()
-                    logger.error(f"Ошибка API для запроса {request_id}: {response.status} - {error_text}")
+                    logger.error(f"❌ Ошибка Gemini API: {response.status} - {error_text}")
+                    return None
                     
-                    # Попробуем старую модель если новая не работает
-                    if "is not found for API version" in error_text:
-                        logger.info("Пробуем использовать gemini-1.0-pro вместо gemini-1.5-flash-latest")
-                        old_model_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
-                        old_url = f"{old_model_url}?key={api_key}"
-                        
-                        async with session.post(old_url, json=payload, headers=headers) as old_response:
-                            if old_response.status == 200:
-                                old_data = await old_response.json()
-                                if "candidates" in old_data and old_data["candidates"]:
-                                    text = old_data["candidates"][0]["content"]["parts"][0]["text"]
-                                    logger.info(f"Успешный ответ с gemini-pro для запроса {request_id}")
-                                    return text
-                    
-                    return f"❌ Ошибка API: {response.status}"
-                    
-    except aiohttp.ClientError as e:
-        logger.error(f"Ошибка сети для запроса {request_id}: {e}")
-        return "❌ Ошибка сети при подключении к API"
     except Exception as e:
-        logger.error(f"Неожиданная ошибка для запроса {request_id}: {e}")
-        return "❌ Неожиданная ошибка при обработке запроса"
+        logger.error(f"❌ Ошибка вызова Gemini: {e}")
+        return None
 
-async def process_request_with_delay(user_id: int, request_id: str, bot: Bot):
-    """Обработка запроса с задержкой в 1 минуту"""
+async def process_request(user_id: int, request_id: str, bot: Bot):
+    """Обработка запроса с задержкой 1 минута"""
     try:
-        # Ждем 1 минуту
+        # Ждем 1 минуту для дополнительных сообщений
         await asyncio.sleep(60)
         
-        # Проверяем, существует ли еще запрос
         if user_id in user_requests and request_id in user_requests[user_id]:
-            request_data = user_requests[user_id][request_id]
-            prompt = request_data.get("prompt", "")
+            user_data = user_requests[user_id][request_id]
+            user_prompt = user_data.get("prompt", "")
             
-            if prompt:
-                # Отправляем уведомление о начале обработки
-                try:
-                    await bot.send_message(user_id, f"🔄 Обрабатываю запрос ID: {request_id}")
-                except:
-                    pass
+            if user_prompt:
+                # Получаем ответ от Gemini
+                response = await call_gemini_api(user_prompt, request_id)
                 
-                # Вызываем API
-                response_text = await call_gemini_api(prompt, request_id)
-                
-                # Форматируем ответ со специальным символом (экранируем для Markdown)
-                formatted_response = f"✨ Ответ на запрос {request_id} ✨\n\n{response_text}\n\n📌 Конец ответа"
-                
-                # Экранируем спецсимволы для Markdown
-                safe_response = escape_markdown(formatted_response)
-                
-                # Отправляем ответ
-                try:
-                    await bot.send_message(
-                        user_id, 
-                        safe_response,
-                        parse_mode=ParseMode.MARKDOWN_V2
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка отправки с Markdown, пробуем без разметки: {e}")
-                    try:
-                        # Пробуем отправить без разметки
-                        await bot.send_message(user_id, formatted_response)
-                    except Exception as e2:
-                        logger.error(f"Ошибка отправки без разметки: {e2}")
+                if response:
+                    # Отправляем ТОЛЬКО ответ от Gemini
+                    await bot.send_message(user_id, response)
+                else:
+                    # Если ошибка, отправляем короткое сообщение
+                    await bot.send_message(user_id, "❌ Ошибка генерации. Попробуйте еще раз.")
             
-            # Удаляем обработанный запрос
+            # Очищаем данные
             if user_id in user_requests:
                 user_requests[user_id].pop(request_id, None)
-                # Если у пользователя больше нет запросов, удаляем его запись
                 if not user_requests[user_id]:
-                    user_requests.pop(user_id, None)
+                    del user_requests[user_id]
     
-    except asyncio.CancelledError:
-        logger.info(f"Таймер для запроса {request_id} отменен")
     except Exception as e:
-        logger.error(f"Ошибка в process_request_with_delay для {request_id}: {e}")
+        logger.error(f"❌ Ошибка обработки: {e}")
     finally:
-        # Удаляем таймер
         if request_id in request_timers:
-            request_timers.pop(request_id, None)
+            del request_timers[request_id]
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    """Обработчик команды /start"""
-    welcome_text = """
-🤖 Привет! Я бот-копирайтер на основе Gemini AI.
+    """Только краткое сообщение о начале"""
+    await message.answer("🤖 Бот-копирайтер готов к работе. Отправьте текст для генерации контента.")
 
-📝 Просто отправь мне текст, и я:
-1. Присвою твоему запросу уникальный ID
-2. Подожду 1 минуту на случай дополнительных уточнений
-3. Обработаю все накопленные запросы
-4. Верну ответы с пометкой ID каждого запроса
-
-💡 Отправь мне текст для начала работы!
-
-Доступные команды:
-/start - начать работу
-/help - помощь
-/status - статус запросов
-/cancel - отменить все запросы
-"""
-    await message.answer(welcome_text)
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    """Обработчик команды /help"""
-    help_text = """
-📚 Помощь по использованию бота:
-
-• Просто отправьте текст - бот начнет обработку
-• Каждому запросу присваивается уникальный ID
-• Бот ждет 1 минуту перед отправкой в Gemini
-• Ответы приходят с указанием ID запроса
-• Разные запросы обрабатываются независимо
-
-❓ Пример: отправьте "Напиши рекламный текст для кофейни"
-
-Доступные команды:
-/status - показать текущие запросы
-/cancel - отменить все ожидающие запросы
-"""
-    await message.answer(help_text)
-
-@router.message(Command("status"))
-async def cmd_status(message: Message):
-    """Показать статус текущих запросов"""
-    user_id = message.from_user.id
-    pending_requests = user_requests.get(user_id, {})
-    
-    if not pending_requests:
-        await message.answer("✅ У вас нет ожидающих запросов.")
-    else:
-        status_text = "📋 Ваши текущие запросы:\n\n"
-        for req_id, req_data in pending_requests.items():
-            prompt_preview = req_data.get("prompt", "")[:50] + "..."
-            created_time = req_data.get("created", "")
-            status_text += f"• ID: {req_id}\n"
-            status_text += f"  Текст: {prompt_preview}\n"
-            status_text += f"  Создан: {created_time}\n"
-            status_text += f"  Статус: ⏳ Ожидает обработки\n\n"
-        
-        await message.answer(status_text)
-
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message):
-    """Отменить все ожидающие запросы"""
-    user_id = message.from_user.id
-    
-    if user_id in user_requests and user_requests[user_id]:
-        count = len(user_requests[user_id])
-        
-        # Отменяем все таймеры
-        cancelled_count = 0
-        for req_id in list(user_requests[user_id].keys()):
-            if req_id in request_timers:
-                try:
-                    request_timers[req_id].cancel()
-                    cancelled_count += 1
-                except:
-                    pass
-                request_timers.pop(req_id, None)
-        
-        # Очищаем запросы пользователя
-        user_requests[user_id].clear()
-        user_requests.pop(user_id, None)
-        
-        await message.answer(f"✅ Отменено {count} запросов ({cancelled_count} таймеров).")
-    else:
-        await message.answer("❌ Нет запросов для отмены.")
+@router.message(Command("prompt"))
+async def cmd_prompt(message: Message):
+    """Показать текущий системный промт"""
+    prompt_preview = SYSTEM_PROMPT[:200] + "..." if len(SYSTEM_PROMPT) > 200 else SYSTEM_PROMPT
+    await message.answer(f"📋 Текущий промт Gemini:\n\n{prompt_preview}\n\nИзменить: GEMINI_PROMPT в настройках Railway")
 
 @router.message()
 async def handle_message(message: Message):
-    """Обработчик всех сообщений"""
+    """Основной обработчик сообщений"""
     user_id = message.from_user.id
-    user_text = message.text
+    user_text = message.text.strip()
     
-    if not user_text.strip():
-        await message.answer("❌ Пожалуйста, отправьте текст для обработки.")
+    if not user_text:
         return
     
-    # Генерируем ID запроса
+    # Создаем ID запроса
     request_id = generate_request_id(user_id)
     
-    # Сохраняем запрос
-    user_requests[user_id][request_id] = {
-        "prompt": user_text,
-        "created": datetime.now().strftime("%H:%M:%S"),
-    }
+    # Сохраняем промпт пользователя
+    if user_id in user_requests:
+        # Если уже есть запрос от пользователя, объединяем
+        existing_id = next(iter(user_requests[user_id].keys()), None)
+        if existing_id:
+            old_prompt = user_requests[user_id][existing_id].get("prompt", "")
+            user_requests[user_id][request_id] = {
+                "prompt": f"{old_prompt}\n\nДополнительно: {user_text}",
+                "created": datetime.now().strftime("%H:%M:%S")
+            }
+            # Отменяем старый таймер
+            if existing_id in request_timers:
+                try:
+                    request_timers[existing_id].cancel()
+                except:
+                    pass
+                del request_timers[existing_id]
+            # Удаляем старый запрос
+            user_requests[user_id].pop(existing_id, None)
+        else:
+            user_requests[user_id][request_id] = {
+                "prompt": user_text,
+                "created": datetime.now().strftime("%H:%M:%S")
+            }
+    else:
+        user_requests[user_id][request_id] = {
+            "prompt": user_text,
+            "created": datetime.now().strftime("%H:%M:%S")
+        }
     
-    # Отправляем подтверждение
-    confirmation_text = f"""
-✅ Запрос получен!
-
-📝 ID запроса: {request_id}
-🕐 Обработка начнется через 1 минуту...
-✏️ Вы можете отправить дополнительные уточнения в течение этого времени.
-
-Используйте /status для проверки состояния.
-Используйте /cancel для отмены всех запросов.
-"""
-    await message.answer(confirmation_text)
+    # Только краткое подтверждение
+    await message.answer(f"✅ Запрос принят. Генерация через 1 минуту...")
     
-    # Если уже есть таймер для этого пользователя, отменяем его
-    existing_timer_id = None
-    for req_id, timer_task in list(request_timers.items()):
-        if req_id.startswith(f"{user_id}_"):
-            try:
-                timer_task.cancel()
-            except:
-                pass
-            existing_timer_id = req_id
-            request_timers.pop(req_id, None)
-            break
-    
-    # Если нашли старый таймер, объединяем промпты
-    if existing_timer_id and existing_timer_id in user_requests[user_id]:
-        old_prompt = user_requests[user_id][existing_timer_id].get("prompt", "")
-        user_requests[user_id][request_id]["prompt"] = old_prompt + "\n\nДополнение:\n" + user_text
-        user_requests[user_id].pop(existing_timer_id, None)
-        logger.info(f"Объединен запрос {existing_timer_id} с {request_id}")
-    
-    # Запускаем новый таймер
-    try:
-        timer_task = asyncio.create_task(
-            process_request_with_delay(user_id, request_id, message.bot)
-        )
-        request_timers[request_id] = timer_task
-        logger.info(f"Создан новый запрос {request_id} для пользователя {user_id}")
-    except Exception as e:
-        logger.error(f"Ошибка создания таймера для {request_id}: {e}")
-        await message.answer("❌ Ошибка при создании запроса. Попробуйте еще раз.")
+    # Запускаем таймер
+    timer = asyncio.create_task(process_request(user_id, request_id, message.bot))
+    request_timers[request_id] = timer
 
 async def main():
-    """Основная функция запуска бота"""
-    try:
-        logger.info("Запуск бота...")
-        logger.info(f"Токен бота: {'установлен' if BOT_TOKEN else 'НЕ УСТАНОВЛЕН!'}")
-        logger.info(f"Доступно API ключей Gemini: {len(GEMINI_API_KEYS)}")
-        logger.info(f"Используемая модель Gemini: {GEMINI_MODEL}")
-        
-        # Новый синтаксис для aiogram 3.7.0+
-        bot = Bot(
-            token=BOT_TOKEN,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-        )
-        
-        dp = Dispatcher()
-        dp.include_router(router)
-        
-        # Проверка соединения
-        me = await bot.get_me()
-        logger.info(f"Бот запущен как @{me.username} ({me.full_name})")
-        
-        await dp.start_polling(bot)
-        
-    except Exception as e:
-        logger.error(f"Ошибка запуска бота: {e}")
-        sys.exit(1)
+    """Запуск бота"""
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties())
+    dp = Dispatcher()
+    dp.include_router(router)
+    
+    logger.info("=" * 50)
+    logger.info("🤖 БОТ ЗАПУЩЕН")
+    logger.info(f"📋 Длина системного промта: {len(SYSTEM_PROMPT)} символов")
+    logger.info(f"🔑 Доступно API ключей: {len(GEMINI_API_KEYS)}")
+    logger.info("=" * 50)
+    
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
